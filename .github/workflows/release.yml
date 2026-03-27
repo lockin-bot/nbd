@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with Nix using Docker
+        run: |
+          ./nix-docker-build.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbd-binaries
+          path: nix-build-output/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nbd-binaries
+          path: release
+
+      - name: List binaries
+        run: |
+          echo "=== Binaries to release ==="
+          ls -lh release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+          echo "=== SHA256 Checksums ==="
+          cat SHA256SUMS
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cat > release_notes.md << EOF
+          ## NBD Release ${TAG}
+
+          This release contains pre-built nbd-server and nbd-client binaries built with Nix.
+
+          ### Build Information:
+          - **Tag**: ${TAG}
+          - **Commit**: ${{ github.sha }}
+          - **Build Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          ### Available Binaries:
+          All binaries are built reproducibly using Nix in Docker.
+
+          ### Features:
+          - **VSOCK Support**: Full Virtual Socket support for virtualized environments
+          - **Backward Compatible**: Maintains compatibility with existing TCP/Unix socket configurations
+          - **Enhanced Client**: New CLI options: --vsock, --vsock-cid, --vsock-port
+          - **Server Support**: Config file support for vsockcid, vsockport, and vsock mode
+
+          ### Usage Examples:
+          \`\`\`bash
+          # Connect to VSOCK server
+          ./nbd-client --vsock --vsock-cid 2 --vsock-port 10809 /dev/nbd0
+
+          # Start VSOCK server
+          ./nbd-server --vsock --vsock-cid VMADDR_CID_ANY --vsock-port 10809
+
+          # Use CID names
+          ./nbd-client --vsock --vsock-cid host --vsock-port 10809 /dev/nbd0
+          \`\`\`
+
+          ### Installation:
+          \`\`\`bash
+          # Download binaries
+          wget https://github.com/${{ github.repository }}/releases/download/${TAG}/nbd-client
+          wget https://github.com/${{ github.repository }}/releases/download/${TAG}/nbd-server
+
+          # Make executable
+          chmod +x nbd-client nbd-server
+          \`\`\`
+
+          ### Verification:
+          \`\`\`bash
+          # Download and verify checksums
+          wget https://github.com/${{ github.repository }}/releases/download/${TAG}/SHA256SUMS
+          sha256sum -c SHA256SUMS
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

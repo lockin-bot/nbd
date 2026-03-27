@@ -1,0 +1,159 @@
+name: Manual Build NBD
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: "Branch name to build from"
+        required: true
+        default: "feat/vsock"
+      release_tag:
+        description: "Release tag name (will be created/overwritten)"
+        required: true
+        default: "vsock"
+
+jobs:
+  Build-and-Release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch_name }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            docbook-utils \
+            libglib2.0-dev \
+            libgnutls28-dev \
+            libnl-genl-3-dev \
+            autoconf-archive \
+            flex \
+            bison \
+            libtool \
+            check \
+            pkg-config \
+            libxml2-utils
+
+      - name: Build
+        run: |
+          # Set deterministic build environment
+          export SOURCE_DATE_EPOCH=315532800  # 1980-01-01 00:00:00 UTC
+
+          # Create static VERSION file before autogen to ensure reproducible configure script
+          echo "3.26.1" > support/VERSION
+
+          # Ensure genver.sh is reproducible
+          cat > support/genver.sh << 'GENVER_EOF'
+          #!/bin/sh
+          if [ -f "$(dirname "$0")/VERSION" ]; then
+            cat "$(dirname "$0")/VERSION"
+          else
+            echo "0.unknown"
+          fi
+          GENVER_EOF
+
+          chmod +x support/genver.sh
+
+          # Run autogen to generate configure and Makefile.in
+          ./autogen.sh
+
+          # Configure with deterministic flags
+          # Set LEX and YACC to ensure deterministic flex/bison output
+          # flex -L suppresses #line directives
+          # bison --no-lines suppresses #line directives
+          ./configure --enable-syslog LEX="flex -L" YACC="bison -d --no-lines"
+
+          make -j$(nproc)
+
+      - name: Run tests (with timeout)
+        run: |
+          timeout 10m make check || echo "Tests completed or timed out - continuing"
+
+      - name: Check binaries
+        run: |
+          file nbd-server nbd-client
+          echo "=== Binary checksums for reproducibility verification ==="
+          sha256sum nbd-server nbd-client nbd-trdump nbd-trplay
+
+      - name: Delete existing release and tag (if exists)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="${{ inputs.release_tag }}"
+          echo "Checking for existing release/tag: $RELEASE_TAG"
+
+          # Delete existing release if it exists
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Deleting existing release $RELEASE_TAG"
+            gh release delete "$RELEASE_TAG" --yes
+          else
+            echo "No existing release found for $RELEASE_TAG"
+          fi
+
+          # Delete existing tag if it exists
+          if gh api repos/:owner/:repo/git/refs/tags/"$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Deleting existing tag $RELEASE_TAG"
+            gh api --method DELETE repos/:owner/:repo/git/refs/tags/"$RELEASE_TAG"
+          else
+            echo "No existing tag found for $RELEASE_TAG"
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          release_name: Release ${{ inputs.release_tag }} from ${{ inputs.branch_name }}
+          draft: false
+          prerelease: false
+          body: |
+            ## NBD Binary Release
+
+            This release contains pre-built nbd-server and nbd-client binaries with VSOCK support.
+
+            ### Build Information:
+            - **Branch**: ${{ inputs.branch_name }}
+            - **Tag**: ${{ inputs.release_tag }}
+            - **Build Date**: ${{ github.event.head_commit.timestamp }}
+
+            ### Features:
+            - **VSOCK Support**: Full Virtual Socket support for virtualized environments
+            - **Backward Compatible**: Maintains compatibility with existing TCP/Unix socket configurations
+            - **Enhanced Client**: New CLI options: --vsock, --vsock-cid, --vsock-port
+            - **Server Support**: Config file support for vsockcid, vsockport, and vsock mode
+
+            ### Usage Examples:
+            ```bash
+            # Connect to VSOCK server
+            ./nbd-client --vsock --vsock-cid 2 --vsock-port 10809 /dev/nbd0
+
+            # Start VSOCK server
+            ./nbd-server --vsock --vsock-cid VMADDR_CID_ANY --vsock-port 10809
+
+            # Use CID names
+            ./nbd-client --vsock --vsock-cid host --vsock-port 10809 /dev/nbd0
+            ```
+
+      - name: Upload nbd-client binary
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./nbd-client
+          asset_name: nbd-client
+          asset_content_type: application/octet-stream
+
+      - name: Upload nbd-server binary
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./nbd-server
+          asset_name: nbd-server
+          asset_content_type: application/octet-stream

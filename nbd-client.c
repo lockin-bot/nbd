@@ -55,6 +55,7 @@
 
 #define MY_NAME "nbd_client"
 #include "cliserv.h"
+#include "vsock_support.h"
 
 #if HAVE_GNUTLS && !defined(NOTLS)
 #include "crypto-gnutls.h"
@@ -80,6 +81,8 @@ void nbdtab_set_property(char *property, char *val) {
 	SET_PROP("bs", bs, strtol(val, NULL, 10));
 	SET_PROP("timeout", timeout, strtol(val, NULL, 10));
 	SET_PROP("conns", nconn, strtol(val, NULL, 10));
+	SET_PROP("vsockcid", vsockcid, val);
+	SET_PROP("vsockport", vsockport, val);
 	if(*property != '_') {
 		fprintf(stderr, "Warning: unknown option '%s' found in nbdtab file", property);
 	}
@@ -93,6 +96,7 @@ void nbdtab_set_flag(char *property) {
 	SET_FLAG("persist", persist);
 	SET_FLAG("swap", swap);
 	SET_FLAG("unix", b_unix);
+	SET_FLAG("vsock", b_vsock);
 	SET_FLAG("preinit", preinit);
 	SET_FLAG("tls", tls);
 	if(*property != '_') {
@@ -335,9 +339,8 @@ err:
 	return sock;
 }
 
-int openunix() {
+int openunix(char *path) {
 	int sock;
-        char *path = cur_client->hostn;
 	struct sockaddr_un un_addr;
 	memset(&un_addr, 0, sizeof(un_addr));
 
@@ -359,6 +362,60 @@ int openunix() {
 		close(sock);
 		return -1;
 	}
+	return sock;
+}
+
+int openvsock() {
+	int sock;
+	unsigned int cid, port;
+
+	if (!is_vsock_supported()) {
+		err_nonfatal("VSOCK not supported on this system");
+		return -1;
+	}
+
+	/* Parse CID */
+	if (cur_client->vsockcid) {
+		cid = parse_vsock_cid(cur_client->vsockcid);
+		if (cid == 0 && strcmp(cur_client->vsockcid, "0") != 0 &&
+		    strcmp(cur_client->vsockcid, "hypervisor") != 0) {
+			err_nonfatal("Invalid VSOCK CID specified");
+			return -1;
+		}
+	} else {
+		err_nonfatal("VSOCK CID not specified");
+		return -1;
+	}
+
+	/* Parse port */
+	if (cur_client->vsockport) {
+		port = parse_vsock_port(cur_client->vsockport);
+		if (port == 0 && strcmp(cur_client->vsockport, "0") != 0) {
+			err_nonfatal("Invalid VSOCK port specified");
+			return -1;
+		}
+	} else {
+		port = NBD_DEFAULT_VSOCK_PORT;
+	}
+
+	/* Create vsock socket */
+	sock = create_vsock_socket();
+	if (sock < 0) {
+		err_nonfatal("Failed to create VSOCK socket");
+		return -1;
+	}
+
+	/* Set socket options */
+	set_vsock_connect_timeout(sock, VSOCK_DEFAULT_CONNECT_TIMEOUT);
+	set_vsock_buffer_size(sock, VSOCK_DEFAULT_BUFFER_SIZE);
+
+	/* Connect to server */
+	if (connect_vsock_socket(sock, cid, port) < 0) {
+		err_nonfatal("Failed to connect to VSOCK server");
+		close(sock);
+		return -1;
+	}
+
 	return sock;
 }
 
@@ -891,6 +948,9 @@ void usage(char* errmsg, ...) {
 #if HAVE_GNUTLS && !defined(NOTLS)
 	fprintf(stderr, "All commands that connect to a host also take:\n\t[-F|-certfile certfile] [-K|-keyfile keyfile]\n\t[-A|-cacertfile cacertfile] [-H|-tlshostname hostname] [-x|-enable-tls]\n\t[-y|-priority gnutls-priority-string]\n");
 #endif
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+	fprintf(stderr, "For VSOCK connections, use: [-vsock|-v] [-vsock-cid|-U cid] [-vsock-port|-o port]\n");
+#endif
 	fprintf(stderr, "Default value for blocksize is 512\n");
 	fprintf(stderr, "Allowed values for blocksize are 512,1024,2048,4096\n"); /* will be checked in kernel :) */
 	fprintf(stderr, "Note, that kernel 2.4.2 and older ones do not work correctly with\n");
@@ -914,7 +974,7 @@ void disconnect(char* device) {
 	close(nbd);
 }
 
-static const char *short_opts = "-B:b:c:d:gH:hlnN:PpRSst:uVxy:"
+static const char *short_opts = "-B:b:c:d:gH:hlnN:PpRSst:uU:o:vVxy:"
 #if HAVE_NETLINK
 	"i:L"
 #endif
@@ -969,6 +1029,9 @@ int main(int argc, char *argv[]) {
 		{ "swap", no_argument, NULL, 's' },
 		{ "timeout", required_argument, NULL, 't' },
 		{ "unix", no_argument, NULL, 'u' },
+		{ "vsock", no_argument, NULL, 'v' },
+		{ "vsock-cid", required_argument, NULL, 'U' },
+		{ "vsock-port", required_argument, NULL, 'o' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "enable-tls", no_argument, NULL, 'x' },
 		{ "priority", required_argument, NULL, 'y' },
@@ -1102,6 +1165,15 @@ int main(int argc, char *argv[]) {
 		case 'u':
 			cur_client->b_unix = 1;
 			break;
+		case 'v':
+			cur_client->b_vsock = 1;
+			break;
+		case 'U':
+			cur_client->vsockcid = strdup(optarg);
+			break;
+		case 'o':
+			cur_client->vsockport = strdup(optarg);
+			break;
 		case 'V':
 			printf("This is %s, from %s\n", PROG_NAME, PACKAGE_STRING);
 			return 0;
@@ -1221,7 +1293,9 @@ int main(int argc, char *argv[]) {
 
 	for (i = 0; i < cur_client->nconn; i++) {
 		if (cur_client->b_unix)
-			sock = openunix();
+			sock = openunix(cur_client->hostn);
+		else if (cur_client->b_vsock)
+			sock = openvsock();
 		else
 			sock = opennet();
 		if (sock < 0)
@@ -1337,7 +1411,9 @@ int main(int argc, char *argv[]) {
 					for (;;) {
 						fprintf(stderr, " Reconnecting\n");
 						if (cur_client->b_unix)
-							sock = openunix();
+							sock = openunix(cur_client->hostn);
+						else if (cur_client->b_vsock)
+							sock = openvsock();
 						else
 							sock = opennet();
 						if (sock >= 0)

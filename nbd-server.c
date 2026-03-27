@@ -124,6 +124,7 @@
 #include "backend.h"
 #include "treefiles.h"
 #include "nbd-helper.h"
+#include "vsock_support.h"
 
 #ifdef WITH_SDP
 #include <sdp_inet.h>
@@ -250,6 +251,7 @@ GArray* modernsocks;	  /**< Sockets for the modern handler. Not used
 			       systems that don't support serving IPv4
 			       and IPv6 from the same socket (like,
 			       e.g., FreeBSD) */
+GArray* vsocksocks;	  /**< Sockets for vsock handler. */
 GArray* childsocks;	/**< parent-side sockets for communication with children */
 int commsocket;		/**< child-side socket for communication with parent */
 static sem_t file_wait_sem;
@@ -292,6 +294,8 @@ struct generic_conf {
         gchar *modernaddr;      /**< address of the modern socket */
         gchar *modernport;      /**< port of the modern socket    */
         gchar *unixsock;	/**< file name of the unix domain socket */
+        gchar *vsockcid;         /**< CID for vsock socket         */
+        gchar *vsockport;        /**< port for vsock socket        */
 	gchar *certfile;        /**< certificate file             */
 	gchar *keyfile;         /**< key file                     */
 	gchar *cacertfile;      /**< CA certificate file          */
@@ -848,6 +852,8 @@ GArray* parse_cfile(gchar* f, struct generic_conf *const genconf, bool expect_ge
 		{ "includedir", FALSE, PARAM_STRING,	&cfdir,                   0 },
 		{ "allowlist",  FALSE, PARAM_BOOL,	&(genconftmp.flags),      F_LIST },
 		{ "unixsock",	FALSE, PARAM_STRING,    &(genconftmp.unixsock),   0 },
+		{ "vsockcid",	FALSE, PARAM_STRING,    &(genconftmp.vsockcid),    0 },
+		{ "vsockport",	FALSE, PARAM_STRING,    &(genconftmp.vsockport),   0 },
 		{ "duallisten",	FALSE, PARAM_BOOL,	&(genconftmp.flags),	  F_DUAL_LISTEN }, // Used to listen on both TCP and unix socket
 		{ "max_threads", FALSE, PARAM_INT,	&(genconftmp.threads),	  0 },
 		{ "force_tls", FALSE, PARAM_BOOL,	&(genconftmp.flags),	  F_FORCEDTLS },
@@ -1847,7 +1853,21 @@ int set_peername(int net, CLIENT *client) {
 	if(netaddr.ss_family == AF_UNIX) {
 		client->clientaddr.ss_family = AF_UNIX;
 		strcpy(peername, "unix");
-	} else {
+	}
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+	else if(netaddr.ss_family == AF_VSOCK) {
+		struct sockaddr_vm *svm;
+		addrinlen = sizeof(struct sockaddr_storage);  /* Reset for getpeername */
+		if (getpeername(net, (struct sockaddr *) &(client->clientaddr), &addrinlen) < 0) {
+			msg(LOG_INFO, "getpeername failed: %m");
+			return -1;
+		}
+		svm = (struct sockaddr_vm *)&(client->clientaddr);
+		snprintf(peername, sizeof(peername), "vsock:%u:%u", svm->svm_cid, svm->svm_port);
+		msg(LOG_INFO, "VSOCK connection from CID %u port %u", svm->svm_cid, svm->svm_port);
+	}
+#endif
+	else {
 		if (getpeername(net, (struct sockaddr *) &(client->clientaddr), &addrinlen) < 0) {
 			msg(LOG_INFO, "getpeername failed: %m");
 			return -1;
@@ -1896,7 +1916,13 @@ int set_peername(int net, CLIENT *client) {
 			int addrbits;
 			if(client->clientaddr.ss_family == AF_UNIX) {
 				tmp = g_strdup(peername);
-			} else {
+			}
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+			else if(client->clientaddr.ss_family == AF_VSOCK) {
+				tmp = g_strdup(peername);
+			}
+#endif
+			else {
 				assert((ai->ai_family == AF_INET) || (ai->ai_family == AF_INET6));
 				if(ai->ai_family == AF_INET) {
 					addrbits = 32;
@@ -3277,6 +3303,11 @@ handle_modern_connection(GArray *const servers, const int sock, struct generic_c
                 }
                 g_array_free(modernsocks, TRUE);
 
+                for (i = 0; i < vsocksocks->len; i++) {
+                        close(g_array_index(vsocksocks, int, i));
+                }
+                g_array_free(vsocksocks, TRUE);
+
                 /* Now that we are in the child process after a
                  * succesful negotiation, we do not need the list of
                  * servers anymore, get rid of it.*/
@@ -3428,6 +3459,13 @@ void serveloop(GArray* servers, struct generic_conf *genconf) {
 		mmax=sock>mmax?sock:mmax;
 	}
 
+	/* Add vsock sockets to the fd_set */
+	for(i=0;i<vsocksocks->len;i++) {
+		int sock = g_array_index(vsocksocks, int, i);
+		FD_SET(sock, &mset);
+		mmax=sock>mmax?sock:mmax;
+	}
+
 	/* Construct a signal mask which is used to make signal testing and
 	 * receiving an atomic operation to ensure no signal is received between
 	 * tests and blocking pselect(). */
@@ -3521,6 +3559,15 @@ void serveloop(GArray* servers, struct generic_conf *genconf) {
 					continue;
 				}
 
+				handle_modern_connection(servers, sock, genconf);
+			}
+			for(i=0; i < vsocksocks->len; i++) {
+				int sock = g_array_index(vsocksocks, int, i);
+				if(!FD_ISSET(sock, &rset)) {
+					continue;
+				}
+
+				/* Use the same modern connection handler for vsock */
 				handle_modern_connection(servers, sock, genconf);
 			}
 			for(i=0; i < childsocks->len; i++) {
@@ -3726,10 +3773,89 @@ out:
 }
 
 /**
+ * Open vsock server sockets
+ *
+ * @param cid_str: String containing the CID to bind to
+ * @param port_str: String containing the port to bind to
+ * @param gerror: GError structure to store error information
+ * @return 0 on success, -1 on error
+ */
+int open_vsock(const gchar *const cid_str, const gchar *const port_str, GError **const gerror) {
+	unsigned int cid, port;
+	int sock;
+
+	if (!is_vsock_supported()) {
+		g_set_error(gerror, NBDS_ERR, NBDS_ERR_SOCKET,
+			    "failed to open vsock socket: vsock not supported on this system");
+		return -1;
+	}
+
+	if (!cid_str || strlen(cid_str) == 0) {
+		cid = VMADDR_CID_ANY;
+	} else {
+		cid = parse_vsock_cid(cid_str);
+		if (cid == 0 && strcmp(cid_str, "0") != 0 && strcmp(cid_str, "hypervisor") != 0) {
+			g_set_error(gerror, NBDS_ERR, NBDS_ERR_SOCKET,
+				    "failed to open vsock socket: invalid CID '%s'", cid_str);
+			return -1;
+		}
+	}
+
+	if (!port_str || strlen(port_str) == 0) {
+		port = NBD_DEFAULT_VSOCK_PORT;
+	} else {
+		port = parse_vsock_port(port_str);
+		if (port == 0 && strcmp(port_str, "0") != 0) {
+			g_set_error(gerror, NBDS_ERR, NBDS_ERR_SOCKET,
+				    "failed to open vsock socket: invalid port '%s'", port_str);
+			return -1;
+		}
+	}
+
+	sock = create_vsock_socket();
+	if (sock < 0) {
+		g_set_error(gerror, NBDS_ERR, NBDS_ERR_SOCKET,
+			    "failed to open vsock socket: failed to create socket: %s",
+			    strerror(errno));
+		return -1;
+	}
+
+	/* Set socket options */
+	set_vsock_connect_timeout(sock, VSOCK_DEFAULT_CONNECT_TIMEOUT);
+	set_vsock_buffer_size(sock, VSOCK_DEFAULT_BUFFER_SIZE);
+
+	/* Note: dosockopts() is not called for VSOCK sockets because
+	 * TCP-specific options (SO_REUSEADDR, SO_LINGER, SO_KEEPALIVE)
+	 * are not supported by VSOCK */
+
+	if (bind_vsock_socket(sock, cid, port) < 0) {
+		g_set_error(gerror, NBDS_ERR, NBDS_ERR_BIND,
+			    "failed to open vsock socket: failed to bind to CID %u port %u: %s",
+			    cid, port, strerror(errno));
+		close(sock);
+		return -1;
+	}
+
+	if (listen_vsock_socket(sock, 10) < 0) {
+		g_set_error(gerror, NBDS_ERR, NBDS_ERR_BIND,
+			    "failed to open vsock socket: failed to start listening: %s",
+			    strerror(errno));
+		close(sock);
+		return -1;
+	}
+
+	msg(LOG_INFO, "Opened vsock socket on CID %u port %u", cid, port);
+	g_array_append_val(vsocksocks, sock);
+
+	return 0;
+}
+
+/**
  * Connect our servers.
  **/
 void setup_servers(GArray *const servers, const gchar *const modernaddr,
                    const gchar *const modernport, const gchar* unixsock,
+                   const gchar *const vsockcid, const gchar *const vsockport,
                    const gint flags ) {
 	struct sigaction sa;
 
@@ -3746,6 +3872,17 @@ void setup_servers(GArray *const servers, const gchar *const modernaddr,
 		GError *gerror = NULL;
 		if (open_modern(modernaddr, modernport, &gerror) == -1) {
 			msg(LOG_ERR, "failed to setup servers: %s",
+				gerror->message);
+			g_clear_error(&gerror);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	/* Setup vsock if configured */
+	if (vsockcid != NULL || vsockport != NULL) {
+		GError *gerror = NULL;
+		if (open_vsock(vsockcid, vsockport, &gerror) == -1) {
+			msg(LOG_ERR, "failed to setup vsock server: %s",
 				gerror->message);
 			g_clear_error(&gerror);
 			exit(EXIT_FAILURE);
@@ -3919,6 +4056,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	modernsocks = g_array_new(FALSE, FALSE, sizeof(int));
+	vsocksocks = g_array_new(FALSE, FALSE, sizeof(int));
 	childsocks = g_array_new(FALSE, FALSE, sizeof(int));
 
 	logging(MY_NAME);
@@ -3955,7 +4093,7 @@ int main(int argc, char *argv[]) {
 		daemonize();
 
 	setup_servers(servers, genconf.modernaddr, genconf.modernport,
-			genconf.unixsock, genconf.flags);
+			genconf.unixsock, genconf.vsockcid, genconf.vsockport, genconf.flags);
 	dousers(genconf.user, genconf.group);
 
 #if HAVE_GNUTLS

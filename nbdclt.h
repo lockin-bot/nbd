@@ -10,6 +10,8 @@ typedef struct {
 	char *key;
 	char *cacert;
 	char *tlshostn;
+	char *vsockcid;
+	char *vsockport;
 	int bs;
 	int timeout;
 	int nconn;
@@ -20,6 +22,7 @@ typedef struct {
 	bool swap;
 	bool sdp;
 	bool b_unix;
+	bool b_vsock;
 	bool preinit;
 	bool force_ro;
 	bool tls;

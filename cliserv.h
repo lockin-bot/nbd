@@ -9,12 +9,22 @@
    Send 128 bytes of zeros (reserved for future use)
  */
 
+#include <stddef.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
-#include <stdlib.h>
+
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+#include <linux/vm_sockets.h>
+#endif
 
 #include "nbd.h"
 
@@ -73,6 +83,41 @@ int writeit(int f, const void *buf, size_t len);
 
 #define NBD_DEFAULT_PORT	"10809"	/* Port on which named exports are
 					 * served */
+
+/* VSOCK support */
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+#ifndef AF_VSOCK
+#define AF_VSOCK 40
+#endif
+#include <linux/vm_sockets.h>
+#endif
+
+/* Fallback definitions for vsock if not available in headers */
+#ifndef AF_VSOCK
+#define AF_VSOCK 40
+#endif
+
+#ifndef VMADDR_CID_ANY
+#define VMADDR_CID_ANY 0xFFFFFFFFU
+#endif
+
+#ifndef VMADDR_CID_HYPERVISOR
+#define VMADDR_CID_HYPERVISOR 0
+#endif
+
+#ifndef VMADDR_CID_LOCAL
+#define VMADDR_CID_LOCAL 1
+#endif
+
+#ifndef VMADDR_CID_HOST
+#define VMADDR_CID_HOST 2
+#endif
+
+#ifndef VMADDR_PORT_ANY
+#define VMADDR_PORT_ANY 0xFFFFFFFFU
+#endif
+
+#define NBD_DEFAULT_VSOCK_PORT 10809  /* Default vsock port for NBD */
 
 /* Options that the client can select to the server */
 #define NBD_OPT_EXPORT_NAME	 (1)	/**< Client wants to select a named export (is followed by name of export) */

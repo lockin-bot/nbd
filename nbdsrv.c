@@ -34,10 +34,17 @@ bool address_matches(const char* mask, const struct sockaddr* addr, GError** err
 	char *masksep;
 	char privmask[strlen(mask)+1];
 	int masklen;
-	int addrlen = addr->sa_family == AF_INET ? 4 : 16;
+	int addrlen;
 #define IPV4_MAP_PREFIX 12
 	uint8_t ipv4_mapped[IPV4_MAP_PREFIX+4] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		255, 255, 0, 0, 0, 0};
+
+	/* For VSOCK connections, always allow (authfile doesn't support VSOCK addresses) */
+	if (addr->sa_family == AF_VSOCK) {
+		return true;
+	}
+
+	addrlen = addr->sa_family == AF_INET ? 4 : 16;
 
 	strcpy(privmask, mask);
 

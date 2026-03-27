@@ -5,9 +5,9 @@ EXTRA_PROGRAMS = nbd-client make-integrityhuge
 noinst_LTLIBRARIES = libnbdsrv.la libcliserv.la libnbdclt.la
 libcliserv_la_SOURCES = cliserv.h cliserv.c
 libcliserv_la_CFLAGS = @CFLAGS@
-client_srcs = nbd-client.c cliserv.h nbd-netlink.h
+client_srcs = nbd-client.c cliserv.h nbd-netlink.h vsock_support.h vsock_support.c
 nbd_server_SOURCES = nbd-server.c cliserv.h lfs.h nbd.h nbdsrv.h backend.h \
-	netdb-compat.h nbd-helper.h
+	netdb-compat.h nbd-helper.h vsock_support.h vsock_support.c
 nbd_trdump_SOURCES = nbd-trdump.c cliserv.h nbd.h
 nbd_trplay_SOURCES = nbd-trplay.c cliserv.h nbd.h
 client_flags = @CFLAGS@
@@ -48,7 +48,7 @@ BUILT_SOURCES = nbdtab_parser.tab.h
 
 nbd-client.c: $(builddir)/nbdtab_parser.tab.h
 nbdtab_parser.tab.h: $(srcdir)/nbdtab_parser.y
-	bison -d $^ > $@
+	bison -d $^ --no-lines > $@
 
 AM_DISTCHECK_CONFIGURE_FLAGS=--enable-syslog
 
