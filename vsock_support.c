@@ -12,6 +12,7 @@
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 
 /* Global flag for vsock support detection */
 static int vsock_support_checked = 0;
@@ -282,7 +283,8 @@ int set_vsock_connect_timeout(int sock, unsigned int timeout_sec) {
         return -1;
     }
 
-    return setsockopt(sock, AF_VSOCK, SO_VM_SOCKETS_CONNECT_TIMEOUT, &timeout_sec, sizeof(timeout_sec));
+    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
+    return setsockopt(sock, AF_VSOCK, SO_VM_SOCKETS_CONNECT_TIMEOUT, &tv, sizeof(tv));
 #else
     return 0; /* Not supported, but don't fail */
 #endif
