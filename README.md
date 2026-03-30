@@ -1,6 +1,45 @@
 NBD README
 ==========
 
+## VSOCK Fork
+
+This is a fork of [NetworkBlockDevice/nbd](https://github.com/NetworkBlockDevice/nbd) that adds **VSOCK (virtio socket) transport support**. The changes are contained in a single commit (`7ebddc70`).
+
+### Why This Fork Exists
+
+AWS Nitro Enclaves have no direct network or filesystem access. The only communication channel to the host is VSOCK. This fork enables NBD to operate over VSOCK, allowing the enclave to mount a block device served from the host.
+
+### What Changed
+
+- **Client:** New CLI options (`--vsock`, `--vsock-cid`, `--vsock-port`) for connecting to an NBD server over VSOCK
+- **Server:** Config file support (`vsockcid`, `vsockport`, `vsock` mode) for serving exports over VSOCK
+- **CID resolution:** Supports named CIDs (`host`, `hypervisor`, `local`) and numeric values
+- **New files:** `vsock_support.c` and `vsock_support.h` -- self-contained VSOCK transport layer
+- **Build system:** Nix flake with reproducible builds (deterministic flex/bison output)
+- **CI/CD:** GitHub Actions workflows for automated releases
+
+All existing TCP and Unix socket functionality is fully preserved. The VSOCK transport is additive only.
+
+### Security Model
+
+NBD itself is a transport layer -- it serves raw blocks and does not provide encryption. **Data at rest security does not depend on NBD.** In our architecture:
+
+- The enclave applies **LUKS disk encryption** on top of the NBD block device using a master key derived from [seal-kms](https://github.com/lockin-bot/seal-kms)
+- The host-side NBD server only sees encrypted (ciphertext) blocks
+- Even with full host access, the block device contents cannot be decrypted without the master key, which only exists inside attested enclave memory
+
+### Reproducible Builds
+
+The Nix build system produces deterministic output, which is important for enclave integrity verification. Build with:
+
+```bash
+nix build            # Default build
+nix build .#minimal  # Minimal build
+nix build .#static   # Static binary
+```
+
+---
+
 Welcome to the NBD userland support files!
 
 This package contains nbd-server and nbd-client.
